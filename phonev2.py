@@ -6,7 +6,9 @@ import logging
 import os
 
 # LOGGING CONFIGURATION 
-LOG_FILE = "phone_validation_cron.log"
+LOG_DIR = "logs"
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, f"phone_validation_{datetime.now().strftime('%Y%m%d')}.log")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -18,14 +20,15 @@ logging.basicConfig(
 
 # MYSQL CONFIGURATION 
 MYSQL_CONFIG = {
-    'host': 'holistique-middleware.c9wdjmzy25ra.ap-south-1.rds.amazonaws.com',
+    'host': '',
     'user': 'Chandan',
-    'password': 'Chandan@#4321',
-    'database': 'email_validator_app'
+    'password': '',
+    'database': ''
 }
-API_TOKEN = "mTrC6lq8XjJW4KrwfldSMsTUqK29Hsco"
+
+API_TOKEN = ""
 DEFAULT_REGION = "IN"
-BATCH_SIZE = 10
+BATCH_SIZE = 5  # Process 200 at a time as required
 
 # PHONE NUMBER UTILS 
 def smart_format_number(number: str, default_region: str = "IN") -> dict:
@@ -71,17 +74,16 @@ def check_whatsapp(complete_number: str, api_token: str) -> bool:
         logging.warning(f"WhatsApp API error for {complete_number}: {e}")
     return False
 
-# MAIN PROCESSING 
+# MAIN PROCESSING
 def process_and_update_rows():
     try:
         conn = mysql.connector.connect(**MYSQL_CONFIG)
         cursor = conn.cursor(dictionary=True)
         update_cursor = conn.cursor()
 
-        # Fetch up to BATCH_SIZE rows for processing
         cursor.execute(f"""
             SELECT id, phone_no FROM marketing_data
-            WHERE phone_no_verification_wa_api = 'Not_Processed'
+            WHERE Phone_Number_Status = 'not_processed'
             LIMIT {BATCH_SIZE}
         """)
         rows = cursor.fetchall()
@@ -92,51 +94,73 @@ def process_and_update_rows():
             phone_no = row['phone_no']
             now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-            # Default values
-            phone_no_verification_wa_api = "Not_Processed"
-            phono_no_status_wa = "pending"
-            other_validation_phone = None
+            phone_number_validated = None
+            phone_number_validated_at = None
+            is_whatsapp_active = None
+            whatsapp_verified_at = None
+            Phone_Number_Status = None
+            Phone_Number_Status_at = now
 
-            # CASE 1: phone_no is null or empty
+            # If phone_no is blank/null, mark invalid and skip checks
             if not phone_no or not str(phone_no).strip():
-                phone_no_verification_wa_api = "invalid"
-                phono_no_status_wa = "successful"
-                other_validation_phone = None
+                phone_number_validated = 'invalid'
+                phone_number_validated_at = now
+                is_whatsapp_active = None
+                whatsapp_verified_at = None
+                Phone_Number_Status = 'invalid'
+                Phone_Number_Status_at = now
                 logging.info(f"ID {row_id}: phone_no empty/null. Marked invalid.")
             else:
+                # Format validation
                 phone_result = smart_format_number(str(phone_no), DEFAULT_REGION)
-                if not phone_result.get("valid"):
-                    phone_no_verification_wa_api = "invalid"
-                    phono_no_status_wa = "successful"
-                    other_validation_phone = None
-                    logging.info(f"ID {row_id}: Invalid format ({phone_no}). Marked invalid.")
+                phone_number_validated = 'valid' if phone_result.get('valid') else 'invalid'
+                phone_number_validated_at = now
+                logging.info(f"ID {row_id}: phone_no '{phone_no}' format validation: {phone_number_validated}")
+
+                # WhatsApp check: Always check, even if format is invalid (try best possible)
+                e164_for_wa = None
+                if phone_result.get('e164_format'):
+                    e164_for_wa = phone_result['e164_format']
+                elif phone_no.isdigit():
+                    e164_for_wa = "+91" + phone_no if not phone_no.startswith("+") else phone_no
                 else:
-                    if check_whatsapp(phone_result["e164_format"], API_TOKEN):
-                        phone_no_verification_wa_api = "valid"
-                        phono_no_status_wa = "successful"
-                        other_validation_phone = None
-                        logging.info(f"ID {row_id}: {phone_no} is on WhatsApp. Marked valid.")
-                    else:
-                        phone_no_verification_wa_api = "invalid"
-                        phono_no_status_wa = "successful"
-                        other_validation_phone = "Need to validate one more step"
-                        logging.info(f"ID {row_id}: {phone_no} NOT on WhatsApp. Marked invalid, needs further validation.")
+                    e164_for_wa = phone_no
+
+                if e164_for_wa:
+                    is_wa = check_whatsapp(e164_for_wa, API_TOKEN)
+                    is_whatsapp_active = 'active' if is_wa else 'inactive'
+                    whatsapp_verified_at = now
+                    logging.info(f"ID {row_id}: WhatsApp check on '{e164_for_wa}' result: {is_whatsapp_active}")
+                else:
+                    is_whatsapp_active = 'inactive'
+                    whatsapp_verified_at = now
+                    logging.info(f"ID {row_id}: WhatsApp check failed due to bad number format.")
+
+                # Final status
+                if phone_number_validated == 'valid' and is_whatsapp_active == 'active':
+                    Phone_Number_Status = 'valid'
+                else:
+                    Phone_Number_Status = 'invalid'
+                Phone_Number_Status_at = now
+                logging.info(f"ID {row_id}: Final Phone_Number_Status: {Phone_Number_Status}")
 
             update_query = """
                 UPDATE marketing_data
-                SET phone_no_verification_wa_api = %s,
-                    phono_no_status_wa = %s,
-                    phone_created_at = IFNULL(phone_created_at, %s),
-                    phone_updated_at = %s,
-                    other_validation_phone = %s
+                SET phone_number_validated = %s,
+                    phone_number_validated_at = %s,
+                    is_whatsapp_active = %s,
+                    whatsapp_verified_at = %s,
+                    Phone_Number_Status = %s,
+                    Phone_Number_Status_at = %s
                 WHERE id = %s
             """
             update_cursor.execute(update_query, (
-                phone_no_verification_wa_api,
-                phono_no_status_wa,
-                now,
-                now,
-                other_validation_phone,
+                phone_number_validated,
+                phone_number_validated_at,
+                is_whatsapp_active,
+                whatsapp_verified_at,
+                Phone_Number_Status,
+                Phone_Number_Status_at,
                 row_id
             ))
             conn.commit()
